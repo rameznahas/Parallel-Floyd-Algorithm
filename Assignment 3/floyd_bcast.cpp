@@ -64,7 +64,7 @@ void gen_directed_graph(int*& G, int n) {
 	for (int i = 0; i < total_count; ++i) {
 		if (G[i] != INF) {
 			int weight = dist(gen);
-			weight = weight < 51 ? INF : weight % 20;
+			weight = weight < 51 ? INF : (weight % 20) + 1;
 
 			int row = i / n;
 			int col = i % n;
