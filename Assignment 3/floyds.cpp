@@ -8,6 +8,18 @@
 #define NODES 8
 #define TAB 5
 
+void malloc_2d_matrix(int**& mat, int n) {
+	mat = new int*[n];
+	for (int i = 0; i < n; ++i)
+		mat[i] = new int[n];
+}
+
+void free_2d_matrix(int**& mat, int n) {
+	for (int i = 0; i < n; ++i)
+		delete[] mat[i];
+	delete[] mat;
+}
+
 void print_separation(int count) {
 	std::string s = "";
 	for (int i = 0; i < count; ++i)
@@ -44,10 +56,11 @@ void print_adj_mat(int** mat, int n, const char* msg) {
 	print_separation(max);
 }
 
+/*
+	Generates a random directed graph and saves it as adjacency matrix G.
+*/
 void gen_directed_graph(int**& G, int n) {
-	G = new int*[n];
-	for (int i = 0; i < n; ++i)
-		G[i] = new int[n];
+	malloc_2d_matrix(G, n);
 
 	for (int r = 0; r < n; ++r)
 		for (int c = 0; c < n; ++c)
@@ -70,40 +83,6 @@ void gen_directed_graph(int**& G, int n) {
 		}
 }
 
-void cpy_directed_graph(int** G, int**& G_cpy, int n) {
-	G_cpy = new int*[n];
-	for (int i = 0; i < n; ++i)
-		G_cpy[i] = new int[n];
-
-	for (int r = 0; r < n; ++r)
-		for (int c = 0; c < n; ++c)
-			G_cpy[r][c] = G[r][c];
-}
-
-void communication(int*& row_buff, int*& col_buff, int**& g, int p_row, int p_col, int k, int dim) {
-	MPI_Comm row_comm, col_comm;
-
-	int row_key = p_col == (k / dim) ? 0 : 1;
-	int col_key = p_row == (k / dim) ? 0 : 1;
-
-	MPI_Comm_split(MPI_COMM_WORLD, p_row, row_key, &row_comm);
-	MPI_Comm_split(MPI_COMM_WORLD, p_col, col_key, &col_comm);
-
-	if (row_key == 0) {
-		int c = k % dim;
-		for (int i = 0; i < dim; ++i)
-			row_buff[i] = g[i][c];
-	}
-
-	if (col_key == 0) {
-		int r = k % dim;
-		for (int i = 0; i < dim; ++i)
-			col_buff[i] = g[r][i];
-	}
-	MPI_Bcast(row_buff, dim, MPI_INT, 0, row_comm);
-	MPI_Bcast(col_buff, dim, MPI_INT, 0, col_comm);
-}
-
 void serial_floyds(int**& G, int n) {
 	for (int k = 0; k < n; ++k)
 		for (int r = 0; r < n; ++r)
@@ -114,6 +93,40 @@ void serial_floyds(int**& G, int n) {
 			}
 }
 
+/*
+	Communication step that is done during parallel floyd's algorithm.
+*/
+void communication(int*& row_buff, int*& col_buff, int**& g, int p_row, int p_col, int k, int dim) {
+	MPI_Comm row_comm, col_comm;
+
+	int row_key = p_col == (k / dim) ? 0 : 1; // determines which process is the root in the row_comm
+	int col_key = p_row == (k / dim) ? 0 : 1; // determines which process is the root in the col_comm
+
+	MPI_Comm_split(MPI_COMM_WORLD, p_row, row_key, &row_comm);
+	MPI_Comm_split(MPI_COMM_WORLD, p_col, col_key, &col_comm);
+
+	// if true, is root.
+	// so copy elements that will be bcasted along the row_comm to row_buff
+	if (row_key == 0) {
+		int c = k % dim;
+		for (int i = 0; i < dim; ++i)
+			row_buff[i] = g[i][c];
+	}
+
+	// if true, is root.
+	// so copy elements that will be bcasted along the col_comm to col_buff
+	if (col_key == 0) {
+		int r = k % dim;
+		for (int i = 0; i < dim; ++i)
+			col_buff[i] = g[r][i];
+	}
+	MPI_Bcast(row_buff, dim, MPI_INT, 0, row_comm);
+	MPI_Bcast(col_buff, dim, MPI_INT, 0, col_comm);
+}
+
+/*
+	Parallel formulation of floyd's algorithm.
+*/
 void parallel_floyds_bcast(int**& g, int p_row, int p_col, int n, int dim) {
 	for (int k = 0; k < n; ++k) {
 		int* row_buff = new int[dim];
@@ -121,6 +134,7 @@ void parallel_floyds_bcast(int**& g, int p_row, int p_col, int n, int dim) {
 
 		communication(row_buff, col_buff, g, p_row, p_col, k, dim);
 
+		// local computation
 		for (int r = 0; r < dim; ++r)
 			for (int c = 0; c < dim; ++c) {
 				int cur_cost = g[r][c];
@@ -132,7 +146,13 @@ void parallel_floyds_bcast(int**& g, int p_row, int p_col, int n, int dim) {
 	}
 }
 
-void prep_for_partition(int*& G_buff, int** G, int p, int p_grid_width, int dim) {
+/*
+	Flattens 2D buffer G into a 1D buffer.
+
+	Flattening is not done row by row, but 2D-block by 2D-block.
+	This is done to respect the 2D partition order of G before scattering it.
+*/
+void flatten_for_scatter(int*& G_buff, int** G, int p, int p_grid_width, int dim) {
 	int idx = 0;
 	for (int i = 0; i < p; ++i) {
 		int p_r = i / p_grid_width;
@@ -148,14 +168,41 @@ void prep_for_partition(int*& G_buff, int** G, int p, int p_grid_width, int dim)
 	}
 }
 
-void init(int argc, char** argv, int**& G, int**& G_cpy, int**& g, int& p, int& pid, int& n, int& total_count, int& count, int& dim, int& p_grid_width, std::pair<int, int>& p_2d_idx) {
+/*
+	Unflattens 1D buffer G_buff back to its initial 2D configuration.
+*/
+void unflatten_after_gather(int**& G, int* G_buff, int p, int p_grid_width, int dim) {
+	int idx = 0;
+	for (int i = 0; i < p; ++i) {
+		int p_r = i / p_grid_width;
+		int p_c = i % p_grid_width;
+
+		for (int r = 0; r < dim; ++r) {
+			int elem_r = p_r * dim + r;
+			for (int c = 0; c < dim; ++c) {
+				int elem_c = p_c * dim + c;
+				G[elem_r][elem_c] = G_buff[idx++];
+			}
+		}
+	}
+}
+
+/*
+	Initializes the program.
+
+		- Initializes MPI and all the necessary program variables.
+		- Allocates heap memory for the necessary memory buffers.
+		- Makes sure the 2D distribution is respected and aborts if it isn't.
+		- Generates random directed graph in process 0 and scatters it to all processes.
+*/
+void init(int argc, char** argv, int**& G, int*& G_buff, int**& g, int*& g_buff, int& p, int& pid, int& n, int& count, int& dim, int& p_grid_width, std::pair<int, int>& p_2d_idx) {
 	n = argc > 1 ? std::stoi(argv[1]) : NODES; // n: num of nodes
 
 	MPI_Init(&argc, &argv);
 	MPI_Comm_size(MPI_COMM_WORLD, &p);
 	MPI_Comm_rank(MPI_COMM_WORLD, &pid);
 
-	total_count = n * n;
+	int total_count = n * n;
 	count = total_count / p;
 	float fdim = sqrtf(count);
 	dim = (int)fdim;
@@ -169,28 +216,21 @@ void init(int argc, char** argv, int**& G, int**& G_cpy, int**& g, int& p, int& 
 		std::exit(1);
 	}
 
-	g = new int*[dim];
-	for (int i = 0; i < dim; ++i) {
-		g[i] = new int[dim];
-	}
+	malloc_2d_matrix(g, dim);
 
-	// 1D buffer of size total_count = n * n, used for scattering data from G to local matrix g.
-	int* G_buff = new int[total_count];
-
-	// 1D buffer of size count = dim * dim, used for scattering data from G to local matrix g.
-	int* g_buff = new int[count];
+	g_buff = new int[count];
 
 	p_grid_width = n / dim;
-	p_2d_idx = { pid / p_grid_width, pid % p_grid_width };
+	p_2d_idx = { pid / p_grid_width, pid % p_grid_width }; // 2D id of process
 
 	if (pid == 0) {
+		G_buff = new int[total_count];
+
 		gen_directed_graph(G, n);
-		cpy_directed_graph(G, G_cpy, n);
 		print_adj_mat(G, n, "cost matrix before floyd's algorithm");
-		prep_for_partition(G_buff, G, p, p_grid_width, dim);
+		flatten_for_scatter(G_buff, G, p, p_grid_width, dim);
 
 		MPI_Scatter(G_buff, count, MPI_INT, g_buff, count, MPI_INT, 0, MPI_COMM_WORLD);
-		delete[] G_buff;
 	}
 	else {
 		MPI_Scatter(G_buff, count, MPI_INT, g_buff, count, MPI_INT, 0, MPI_COMM_WORLD);
@@ -201,27 +241,36 @@ void init(int argc, char** argv, int**& G, int**& G_cpy, int**& g, int& p, int& 
 		int c = i % dim;
 		g[r][c] = g_buff[i];
 	}
-
-	delete[] g_buff;
 }
 
 int main(int argc, char** argv) {
-	int p, pid, n, total_count, count, dim, p_grid_width;
-	int** G = nullptr, **G_cpy = nullptr, **g = nullptr;
+	int p, pid, n, count, dim, p_grid_width;
+	int** G = nullptr, **g = nullptr;
 	int* G_buff = nullptr, *g_buff = nullptr;
 	std::pair<int, int> p_2d_idx;
+	clock_t start, end, Tp, Ts;
 
-	init(argc, argv, G, G_cpy, g, p, pid, n, total_count, count, dim, p_grid_width, p_2d_idx);
+	init(argc, argv, G, G_buff, g, g_buff, p, pid, n, count, dim, p_grid_width, p_2d_idx);
 
-	clock_t start = clock(), Tp;
-	parallel_floyds_bcast(g, p_2d_idx.first, p_2d_idx.second, n, count);
+	if (pid == 0) start = clock();
+	parallel_floyds_bcast(g, p_2d_idx.first, p_2d_idx.second, n, dim);
+
 	MPI_Barrier(MPI_COMM_WORLD);
 
+	// parallel floyd done. get Tp, now do serial floyds and get Ts.
 	if (pid == 0) {
-		clock_t end = clock();
+		end = clock();
 		Tp = (end - start) * 1000 / CLOCKS_PER_SEC;
+
+		start = clock();
+		serial_floyds(G, n);
+		end = clock();
+		Ts = (end - start) * 1000 / CLOCKS_PER_SEC;
+
+		print_adj_mat(G, n, "cost matrix after serial floyd's algorithm");
 	}
 
+	// flatten local matrix before gathering at root
 	for (int i = 0; i < count; ++i) {
 		int r = i / dim;
 		int c = i % dim;
@@ -229,41 +278,24 @@ int main(int argc, char** argv) {
 	}
 
 	if (pid == 0) {
-		G_buff = new int[total_count];
 		MPI_Gather(g_buff, count, MPI_INT, G_buff, count, MPI_INT, 0, MPI_COMM_WORLD);
+		unflatten_after_gather(G, G_buff, p, p_grid_width, dim);
+		
+		print_adj_mat(G, n, "cost matrix after parallel floyd's algorithm");
+		std::cout << "Ts: " << Ts << "ms" << std::endl;
+		std::cout << "Tp: " << Tp << "ms" << std::endl;
 
-		int idx = 0;
-		for (int i = 0; i < p; ++i) {
-			int p_r = i / p_grid_width;
-			int p_c = i % p_grid_width;
-
-			for (int r = 0; r < dim; ++r) {
-				int elem_r = p_r * dim + r;
-				for (int c = 0; c < dim; ++c) {
-					int elem_c = p_c * dim + c;
-					G[elem_r][elem_c] = G_buff[idx];
-				}
-			}
-		}
+		// cleanup
+		free_2d_matrix(G, n);
+		delete[] G_buff;
 	}
 	else {
 		MPI_Gather(g_buff, count, MPI_INT, G_buff, count, MPI_INT, 0, MPI_COMM_WORLD);
 	}
 
-	if (pid == 0) {
-		start = clock();
-		serial_floyds(G_cpy, n);
-		clock_t end = clock();
-		clock_t Ts = (end - start) * 1000 / CLOCKS_PER_SEC;
-
-		print_adj_mat(G_cpy, n, "cost matrix after serial floyd's algorithm");
-		print_adj_mat(G, n, "cost matrix after parallel floyd's algorithm");
-		std::cout << "Ts: " << Ts << "ms" << std::endl;
-		std::cout << "Tp: " << Tp << "ms" << std::endl;
-		delete[] G, G_cpy, G_buff;
-	}
-
-	delete[] g, g_buff;
+	// cleanup
+	free_2d_matrix(g, dim);
+	delete[] g_buff;
 
 	MPI_Finalize();
 }
